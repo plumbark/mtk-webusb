@@ -172,7 +172,27 @@ async function run(port) {
 
         const devChk = await word(), upStatus = await word();
         log(`SEND_DA: device_checksum=${h16(devChk)} local_checksum=${h16(chk)} status=${h16(upStatus)}`
-          + (devChk === chk ? '  (match)' : '  (MISMATCH)'));
+          + (devChk === chk ? '  (match)' : devChk === 0 ? '  (0 — mtkclient treats this as non-fatal, verifying by readback)' : '  (MISMATCH)'));
+
+        // Independent check: read the bytes back from SRAM via READ32 (0xD1) and
+        // compare to what we meant to send, rather than trust the checksum alone.
+        const dwords = Math.ceil(stub.length / 4);
+        await echo(0xD1);                 // READ32
+        await echoU32(address);
+        await echoU32(dwords);
+        const rstatus1 = await word();
+        if (rstatus1 > 0xFF) throw new Error(`READ32 rejected: status=${h16(rstatus1)}`);
+        const got = new Uint8Array(dwords * 4);
+        for (let i = 0; i < dwords; i++) {
+          const v = await u32();
+          got[i * 4] = (v >>> 24) & 0xFF; got[i * 4 + 1] = (v >>> 16) & 0xFF;
+          got[i * 4 + 2] = (v >>> 8) & 0xFF; got[i * 4 + 3] = v & 0xFF;
+        }
+        const rstatus2 = await word();
+        let mismatches = 0;
+        for (let i = 0; i < stub.length; i++) if (got[i] !== stub[i]) mismatches++;
+        log(`READ32 verify: read ${dwords} dwords back, status=${h16(rstatus1)}/${h16(rstatus2)}, `
+          + `${mismatches === 0 ? 'bytes match the stub exactly' : `${mismatches}/${stub.length} bytes differ`}`);
       });
     } else {
       log(`SEND_DA test skipped: hw_code ${h16(hwCode)} != 0x0335 (stub is chip-specific)`);
