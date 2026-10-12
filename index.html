@@ -63,6 +63,32 @@ async function run(port) {
       log(`${hex(tx)} -> ${hex(rx)}`);
     }
     log('handshake OK');
+
+    // BROM commands: send cmd byte, device echoes it, then big-endian 16-bit words follow
+    const readN = async n => {
+      const out = [];
+      while (out.length < n) {
+        const b = await read1(1000);
+        if (b === null) throw new Error('read timeout');
+        out.push(b);
+      }
+      return out;
+    };
+    const word = async () => { const [h, l] = await readN(2); return (h << 8) | l; };
+    const h16 = v => '0x' + v.toString(16).padStart(4, '0').toUpperCase();
+    const echo = async c => {
+      await send(c);
+      const r = await read1(1000);
+      if (r !== c) throw new Error(`echo ${hex(c)} -> ${r === null ? 'none' : hex(r)}`);
+    };
+
+    await echo(0xFD);                       // GET_HW_CODE
+    const hwCode = await word(), st1 = await word();
+    log(`GET_HW_CODE: hw_code=${h16(hwCode)} status=${h16(st1)}`);
+
+    await echo(0xFC);                       // GET_HW_SW_VER
+    const hwSub = await word(), hwVer = await word(), swVer = await word(), st2 = await word();
+    log(`GET_HW_SW_VER: hw_sub=${h16(hwSub)} hw_ver=${h16(hwVer)} sw_ver=${h16(swVer)} status=${h16(st2)}`);
   } finally {
     try { await reader?.cancel(); } catch {}
     try { reader?.releaseLock(); writer?.releaseLock(); } catch {}
