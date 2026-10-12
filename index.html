@@ -1,0 +1,113 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>mtkclient in the browser (Web Serial)</title>
+<style>
+  body{font:14px monospace;background:#111;color:#ddd;margin:12px}
+  button{font:inherit;padding:10px 14px;margin-right:6px}
+  pre{white-space:pre-wrap}
+</style>
+<button id="go">Connect + read device info</button>
+<button id="stop" disabled>Cancel</button>
+<pre id="log"></pre>
+<script>
+const logEl = document.getElementById('log');
+const log = m => { logEl.textContent += String(m).replace(/\x1b\[[0-9;]*m/g, '') + '\n'; };
+const PYODIDE = 'https://cdn.jsdelivr.net/pyodide/v0.28.0/full/';
+
+// Web Serial <-> Python bridge (see shim/webserial_class.py for the contract).
+const bridge = window.mtkBridge = {
+  port: null, reader: null, writer: null, chunks: [], queued: 0, wake: null, pumpErr: null, cancelled: false,
+
+  async pick() {
+    this.port = (await navigator.serial.getPorts()).find(p => p.getInfo().usbVendorId === 0x0E8D)
+             || await navigator.serial.requestPort({ filters: [{ usbVendorId: 0x0E8D }] });
+  },
+  async open() {
+    if (!this.port) return false;
+    if (this.reader) return true;
+    await this.port.open({ baudRate: 115200 });
+    try { await this.port.setSignals({ dataTerminalReady: true, requestToSend: true }); } catch {}
+    this.writer = this.port.writable.getWriter();
+    this.reader = this.port.readable.getReader();
+    this.chunks = []; this.queued = 0; this.pumpErr = null;
+    const reader = this.reader;
+    (async () => {  // one read in flight, nothing ever dropped
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (value && value.length) { this.chunks.push(value); this.queued += value.length; this.wake?.(); }
+        }
+      } catch (e) { this.pumpErr = e; this.wake?.(); }
+    })();
+    return true;
+  },
+  async close() {
+    const { reader, writer, port } = this;
+    this.reader = this.writer = null; this.chunks = []; this.queued = 0;
+    try { await reader?.cancel(); } catch {}
+    try { reader?.releaseLock(); writer?.releaseLock(); } catch {}
+    try { await port?.close(); } catch {}
+  },
+  async write(d) {
+    const u8 = d instanceof Uint8Array ? d : new Uint8Array(d.toJs ? d.toJs() : d);
+    await this.writer.write(u8);
+  },
+  inWaiting() { return this.queued; },
+  async setSignals(rts, dtr) {
+    try { await this.port.setSignals({ requestToSend: rts, dataTerminalReady: dtr }); } catch {}
+  },
+  sleep(ms) { return new Promise(r => setTimeout(r, ms)); },
+  async read(n, timeoutMs) {
+    const deadline = performance.now() + timeoutMs;
+    while (this.queued < n && !this.pumpErr) {
+      const left = deadline - performance.now();
+      if (left <= 0) break;
+      await new Promise(r => { this.wake = r; setTimeout(r, Math.min(left, 20)); });
+    }
+    const k = Math.min(n, this.queued), out = new Uint8Array(k);
+    let o = 0;
+    while (o < k) {
+      const c = this.chunks[0], t = Math.min(c.length, k - o);
+      out.set(c.subarray(0, t), o); o += t;
+      if (t === c.length) this.chunks.shift(); else this.chunks[0] = c.subarray(t);
+    }
+    this.queued -= k;
+    return out;
+  },
+};
+
+let py = null;
+async function loadPython() {
+  if (py) return py;
+  log('loading Pyodide...');
+  const { loadPyodide } = await import(PYODIDE + 'pyodide.mjs');
+  py = await loadPyodide({ indexURL: PYODIDE, stdout: log, stderr: log });
+  await py.loadPackage('pycryptodome');
+  log('unpacking mtkclient bundle...');
+  py.unpackArchive(await (await fetch('mtkclient_pkg.zip')).arrayBuffer(), 'zip', { extractDir: '/mtk' });
+  for (const f of ['webserial_class.py', 'boot.py'])
+    py.FS.writeFile('/mtk/' + f, await (await fetch('shim/' + f)).text());
+  py.runPython("import sys; sys.path.insert(0, '/mtk')");
+  return py;
+}
+
+const goBtn = document.getElementById('go'), stopBtn = document.getElementById('stop');
+goBtn.onclick = async () => {
+  if (!navigator.serial) return log('Web Serial unavailable (Chrome/Edge over https or localhost).');
+  goBtn.disabled = true; stopBtn.disabled = false; bridge.cancelled = false;
+  try {
+    await bridge.pick();                       // needs the click's user gesture
+    const p = await loadPython();
+    log('power the phone off, hold the BROM key combo, plug in USB...');
+    const res = await p.runPythonAsync('import boot; boot.probe()');
+    log('\nRESULT ' + res);
+  } catch (e) {
+    log(bridge.cancelled ? 'cancelled' : `ERROR: ${e.name || ''}: ${e.message || e}`);
+  } finally {
+    await bridge.close(); goBtn.disabled = false; stopBtn.disabled = true;
+  }
+};
+stopBtn.onclick = () => { bridge.cancelled = true; };
+</script>
