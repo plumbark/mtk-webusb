@@ -19,7 +19,7 @@ let busy = false;
 async function run(port) {
   if (!navigator.serial) throw new Error('Web Serial unavailable (needs Chrome/Edge over https or localhost)');
   if (busy) return; busy = true;
-  let reader, writer;
+  let reader, writer, pumping = false;
   try {
     // MediaTek VID 0x0E8D; BROM PID 0x0003, preloader 0x2000/0x2001
     port ||= (await navigator.serial.getPorts()).find(p => p.getInfo().usbVendorId === 0x0E8D)
@@ -31,16 +31,33 @@ async function run(port) {
     writer = port.writable.getWriter();
     reader = port.readable.getReader();
 
-    // One outstanding read, reused across timeouts; byte queue on top
-    let pending = null; const buf = [];
-    const rd = () => pending ??= reader.read().then(
-      r => { pending = null; if (r.done) throw new Error('port closed'); return r.value; },
-      e => { pending = null; throw e; });
+    // Background pump: continuously drains reader.read() into a byte queue.
+    // Earlier version raced each read1() call against its own reader.read(),
+    // and a losing race silently dropped whatever bytes arrived late — which
+    // then misaligned every read for the rest of the session. This version
+    // never discards a byte: the pump always has at most one reader.read()
+    // in flight and queues everything it gets, so read1() just polls the
+    // queue with a deadline instead of racing the read itself.
+    const buf = [];
+    let pumpError = null;
+    pumping = true;
+    (async () => {
+      try {
+        while (pumping) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (value) for (const b of value) buf.push(b);
+        }
+      } catch (e) { if (pumping) pumpError = e; }
+    })();
     const read1 = async ms => {
-      if (buf.length) return buf.shift();
-      const v = await Promise.race([rd(), sleep(ms).then(() => null)]);
-      if (!v) return null;
-      buf.push(...v); return buf.shift();
+      const t0 = Date.now();
+      while (buf.length === 0) {
+        if (pumpError) throw pumpError;
+        if (Date.now() - t0 > ms) return null;
+        await sleep(2);
+      }
+      return buf.shift();
     };
     const drain = async () => { while (await read1(30) !== null); };
     const send = b => writer.write(Uint8Array.of(b));
@@ -249,6 +266,7 @@ async function run(port) {
 
     log('done');
   } finally {
+    pumping = false;
     try { await reader?.cancel(); } catch {}
     try { reader?.releaseLock(); writer?.releaseLock(); } catch {}
     try { await port?.close(); } catch {}
