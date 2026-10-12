@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 tmp = tempfile.mkdtemp()
 zipfile.ZipFile("mtkclient_pkg.zip").extractall(tmp)
 sys.path[:0] = [tmp, "shim"]
+sys.modules["colorama"] = None  # simulate Pyodide: colorama not installed
 
 # Cryptodome isn't installed in this sandbox; the handshake path never touches it.
 for name in ["Cryptodome", "Cryptodome.Cipher", "Cryptodome.Hash", "Cryptodome.PublicKey",
@@ -28,7 +29,8 @@ class FakeBrom:
     def read(self, n, ms):
         out = bytes(self.rx[:n]); del self.rx[:n]; return out
 
-import webserial_class, boot
+import boot            # browser does `import boot` first
+import webserial_class
 fake = FakeBrom(); webserial_class.set_bridge(fake)
 boot.install_stubs()
 

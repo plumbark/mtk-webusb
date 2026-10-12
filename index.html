@@ -86,9 +86,14 @@ async function loadPython() {
   py = await loadPyodide({ indexURL: PYODIDE, stdout: log, stderr: log });
   await py.loadPackage('pycryptodome');
   log('unpacking mtkclient bundle...');
-  py.unpackArchive(await (await fetch('mtkclient_pkg.zip')).arrayBuffer(), 'zip', { extractDir: '/mtk' });
-  for (const f of ['webserial_class.py', 'boot.py'])
-    py.FS.writeFile('/mtk/' + f, await (await fetch('shim/' + f)).text());
+  const NC = { cache: 'no-store' };   // never reuse a stale copy of the shim files
+  py.unpackArchive(await (await fetch('mtkclient_pkg.zip', NC)).arrayBuffer(), 'zip', { extractDir: '/mtk' });
+  for (const f of ['webserial_class.py', 'boot.py']) {
+    const text = await (await fetch('shim/' + f, NC)).text();
+    py.FS.writeFile('/mtk/' + f, text);
+    if (f === 'boot.py')
+      log(text.includes('install_base_stubs') ? 'boot.py: current version' : 'boot.py: OLD version, replace shim/boot.py');
+  }
   py.runPython("import sys; sys.path.insert(0, '/mtk')");
   return py;
 }
