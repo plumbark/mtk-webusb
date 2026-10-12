@@ -127,6 +127,57 @@ async function run(port) {
     await idCmd('GET_ME_ID', 0xE1);
     await idCmd('GET_SOC_ID', 0xE7);
 
+    // --- step 2: SEND_DA test (upload-only, no JUMP_DA — nothing executes) ---
+    // Only valid for hw_code 0x335 (MT6737M/MT6735G, your Lenovo K10A40).
+    // Note: BROM's "hw_code" (0x335) and the DA container's "dacode" (0x6735)
+    // are different numbering schemes for the same chip — both refer to it.
+    // This stub is region[0] of mtkclient's MTK_DA_V5.bin for dacode 0x6735:
+    // 624 bytes, destined for SRAM at 0x50000000. SEND_DA only copies bytes
+    // into RAM and reads back a checksum — it can't touch flash or boot
+    // anything on its own.
+    if (hwCode === 0x335) {
+      await tryCmd('SEND_DA (stage0 stub)', async () => {
+        const b64 = "TU1NATgAAABGSUxFX0lORk8AAAABAAAABwAAAgAAAFBwAgAAAEAAADgAAAAAAQAAmQAhsAEAAACwtQQc" +
+          "ACABJS0EATCoQvzbAPAo+AAoD9EA8Cb4ACgE0SAcAPAj+AAoF9EhHAAgAPAf+AAoEdEI4ADwFvgAKATRIBwA8BP4ACgH0QDw" +
+          "FPgAKAPRATCoQvzbACCwvAi8GEcAIHBHACBwRwAgcEcAIHBHACBwR3BHACBwRwAA8AMt6QEw4OEBQIHgA1CD4ARghOAFcIXg" +
+          "BoCG4AeQh+D6A4Do8AO96B7/L+HwHy3pAMCg4wEw4OHwD5DoAQBU4QnAoBMZAAAaAwBV4QrAoBMWAAAaARCB4AEAVuELwKAT" +
+          "EgAAGgMwg+ADAFfhDMCgEw4AABoBEIHgAQBY4Q3AoBMKAAAaAzCD4AMAWeEOwKATBgAAGgEQgeABAFrhD8CgEwIAABoDMIPg" +
+          "AwBb4RDAoBMMAKDh8B+96B7/L+HFNEk3xZFEajwtf3htgQ8CRv5AoU2W4I3q2aMO/623m9ELo5MXq0CDtk/5rqGSnkGc1Le0" +
+          "PYoNkj42SMLAP0PYTp9dqVeDPgC5zfdhI7gfAlZJkp/PDONrcL07X9Z2IoCzzdFkRAdm0ZrfmCoeUEJ8PrH7XV2XUo7afFro" +
+          "90a+ETOMTJEfEMm/JiFvO49DfGU2plS3hadoVsquT0CuONV6BTXNx580vXrTdU7utZwh6t3eM8cCfXZtdkZu5O3BdfJvY/t" +
+          "4YXH3p1Rtc2LjeYaHyhHFIXOKmOi2b+2v3u76EWcXkgnsRrmpwUvCjfZoj2xOfUHMq/FWRZqAyfB1ssWW";
+        const stub = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        const address = 0x50000000, sigLen = 0;
+
+        const echoU32 = async v => {
+          await writer.write(Uint8Array.of((v >>> 24) & 0xFF, (v >>> 16) & 0xFF, (v >>> 8) & 0xFF, v & 0xFF));
+          const got = await u32();
+          if (got !== (v >>> 0)) throw new Error(`echo u32 ${h32(v)} -> ${h32(got)}`);
+        };
+
+        log(`SEND_DA: uploading ${stub.length}-byte stub to ${h32(address)} (SRAM, not executed)`);
+        await echo(0xD7);              // SEND_DA
+        await echoU32(address);
+        await echoU32(stub.length);
+        await echoU32(sigLen);
+
+        const acceptStatus = await word();
+        if (acceptStatus === 0x1D0D) throw new Error('SLA required (not implemented here)');
+        if (acceptStatus > 0xFF) throw new Error(`DA_Send rejected: status=${h16(acceptStatus)}`);
+
+        await writer.write(stub);      // whole buffer in one write; Web Serial has no raw-USB
+                                        // packet framing, so there's no literal ZLP to send here
+        let chk = 0;                    // mtkclient's checksum: XOR of little-endian 16-bit words
+        for (let i = 0; i < stub.length; i += 2) chk ^= stub[i] | (stub[i + 1] << 8);
+
+        const devChk = await word(), upStatus = await word();
+        log(`SEND_DA: device_checksum=${h16(devChk)} local_checksum=${h16(chk)} status=${h16(upStatus)}`
+          + (devChk === chk ? '  (match)' : '  (MISMATCH)'));
+      });
+    } else {
+      log(`SEND_DA test skipped: hw_code ${h16(hwCode)} != 0x0335 (stub is chip-specific)`);
+    }
+
     log('done');
   } finally {
     try { await reader?.cancel(); } catch {}
