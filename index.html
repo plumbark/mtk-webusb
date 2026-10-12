@@ -127,6 +127,39 @@ async function run(port) {
     await idCmd('GET_ME_ID', 0xE1);
     await idCmd('GET_SOC_ID', 0xE7);
 
+    // --- sanity check: WRITE32 one known value, then READ32 it back ---
+    // Simpler than SEND_DA — isolates whether 0x50000000 is writable at all
+    // and whether chunked writes land correctly, before trusting SEND_DA's result.
+    if (hwCode === 0x335) {
+      await tryCmd('WRITE32/READ32 sanity check', async () => {
+        const echoU32 = async v => {
+          await writer.write(Uint8Array.of((v >>> 24) & 0xFF, (v >>> 16) & 0xFF, (v >>> 8) & 0xFF, v & 0xFF));
+          const got = await u32();
+          if (got !== (v >>> 0)) throw new Error(`echo u32 ${h32(v)} -> ${h32(got)}`);
+        };
+        const addr = 0x50000000, testVal = 0xDEADBEEF;
+
+        await echo(0xD2);              // WRITE32
+        await echoU32(addr);
+        await echoU32(1);              // 1 value
+        const wst1 = await word();
+        if (wst1 > 0xFF) throw new Error(`WRITE32 rejected: status=${h16(wst1)}`);
+        await echoU32(testVal);
+        const wst2 = await word();
+        log(`WRITE32: wrote ${h32(testVal)} to ${h32(addr)}, status=${h16(wst1)}/${h16(wst2)}`);
+
+        await echo(0xD1);              // READ32
+        await echoU32(addr);
+        await echoU32(1);
+        const rst1 = await word();
+        if (rst1 > 0xFF) throw new Error(`READ32 rejected: status=${h16(rst1)}`);
+        const readBack = await u32();
+        const rst2 = await word();
+        log(`READ32: read back ${h32(readBack)} from ${h32(addr)}, status=${h16(rst1)}/${h16(rst2)}`
+          + (readBack === testVal ? '  (match)' : '  (MISMATCH — single-word write/read did not round-trip)'));
+      });
+    }
+
     // --- step 2: SEND_DA test (upload-only, no JUMP_DA — nothing executes) ---
     // Only valid for hw_code 0x335 (MT6737M/MT6735G, your Lenovo K10A40).
     // Note: BROM's "hw_code" (0x335) and the DA container's "dacode" (0x6735)
