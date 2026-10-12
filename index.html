@@ -165,8 +165,16 @@ async function run(port) {
         if (acceptStatus === 0x1D0D) throw new Error('SLA required (not implemented here)');
         if (acceptStatus > 0xFF) throw new Error(`DA_Send rejected: status=${h16(acceptStatus)}`);
 
-        await writer.write(stub);      // whole buffer in one write; Web Serial has no raw-USB
-                                        // packet framing, so there's no literal ZLP to send here
+        // Write in small chunks with a short gap, instead of one big write — BROM's
+        // ROM-level USB stack has very little RX buffering, and mtkclient's own
+        // backend writes in wMaxPacketSize pieces rather than all at once.
+        const CHUNK = 64;
+        for (let off = 0; off < stub.length; off += CHUNK) {
+          await writer.write(stub.slice(off, off + CHUNK));
+          await sleep(5);
+        }
+        await sleep(150);               // settle time before reading the reply, mirroring
+                                         // mtkclient's time.sleep(0.12) after the upload
         let chk = 0;                    // mtkclient's checksum: XOR of little-endian 16-bit words
         for (let i = 0; i < stub.length; i += 2) chk ^= stub[i] | (stub[i + 1] << 8);
 
@@ -189,10 +197,18 @@ async function run(port) {
           got[i * 4 + 2] = (v >>> 8) & 0xFF; got[i * 4 + 3] = v & 0xFF;
         }
         const rstatus2 = await word();
-        let mismatches = 0;
-        for (let i = 0; i < stub.length; i++) if (got[i] !== stub[i]) mismatches++;
+        let mismatches = 0, firstDiff = -1;
+        for (let i = 0; i < stub.length; i++) {
+          if (got[i] !== stub[i]) { mismatches++; if (firstDiff === -1) firstDiff = i; }
+        }
         log(`READ32 verify: read ${dwords} dwords back, status=${h16(rstatus1)}/${h16(rstatus2)}, `
           + `${mismatches === 0 ? 'bytes match the stub exactly' : `${mismatches}/${stub.length} bytes differ`}`);
+        if (firstDiff !== -1) {
+          const lo = Math.max(0, firstDiff - 4), hi = Math.min(stub.length, firstDiff + 12);
+          log(`  first diff at byte ${firstDiff}:`);
+          log(`    expected: ${bytesHex(stub.slice(lo, hi))}`);
+          log(`    got:      ${bytesHex(got.slice(lo, hi))}`);
+        }
       });
     } else {
       log(`SEND_DA test skipped: hw_code ${h16(hwCode)} != 0x0335 (stub is chip-specific)`);
