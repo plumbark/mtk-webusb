@@ -1,0 +1,90 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MTK WebUSB handshake</title>
+<style>
+  body{font:14px monospace;background:#111;color:#ddd;margin:12px}
+  button{font:inherit;padding:10px 14px}
+  pre{white-space:pre-wrap}
+</style>
+<button id="go">Connect + handshake</button>
+<pre id="log"></pre>
+<script>
+const logEl = document.getElementById('log');
+const log = m => { logEl.textContent += m + '\n'; };
+const hex = b => '0x' + b.toString(16).padStart(2, '0').toUpperCase();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function run() {
+  if (!navigator.usb) throw new Error('WebUSB unavailable (needs Chrome/Edge over https or localhost)');
+
+  // MediaTek VID; BROM = 0x0003, preloader = 0x2000/0x2001
+  const dev = await navigator.usb.requestDevice({ filters: [{ vendorId: 0x0E8D }] });
+  await dev.open();
+  if (!dev.configuration) await dev.selectConfiguration(1);
+  log(`opened ${hex(dev.vendorId)}:${hex(dev.productId)}`);
+
+  // Locate CDC ACM comm (class 2) + data (class 10) interfaces and bulk endpoints
+  let comm = null, data = null, epIn, epOut;
+  for (const i of dev.configuration.interfaces) {
+    const a = i.alternates[0];
+    if (a.interfaceClass === 0x02) comm = i.interfaceNumber;
+    if (a.interfaceClass === 0x0A) {
+      data = i.interfaceNumber;
+      for (const e of a.endpoints) {
+        if (e.type !== 'bulk') continue;
+        if (e.direction === 'in') epIn = e.endpointNumber; else epOut = e.endpointNumber;
+      }
+    }
+  }
+  if (data === null || epIn === undefined || epOut === undefined) throw new Error('CDC data interface/endpoints not found');
+  if (comm !== null) await dev.claimInterface(comm);
+  await dev.claimInterface(data);
+  log(`comm=${comm} data=${data} in=${epIn} out=${epOut}`);
+
+  // SET_LINE_CODING (115200 8N1) + SET_CONTROL_LINE_STATE (DTR|RTS)
+  if (comm !== null) {
+    try {
+      await dev.controlTransferOut(
+        { requestType: 'class', recipient: 'interface', request: 0x20, value: 0, index: comm },
+        new Uint8Array([0x00, 0xC2, 0x01, 0x00, 0x00, 0x00, 0x08])
+      );
+      await dev.controlTransferOut(
+        { requestType: 'class', recipient: 'interface', request: 0x22, value: 0x03, index: comm }
+      );
+      log('line coding set');
+    } catch (e) { log('line coding failed (continuing): ' + e.message); }
+  }
+
+  // Single outstanding read, reused across timeouts so no bytes get lost
+  let pending = null;
+  const rd = () => pending ??= dev.transferIn(epIn, 64).then(
+    r => { pending = null; return new Uint8Array(r.data.buffer); },
+    e => { pending = null; throw e; }
+  );
+  const read1 = async ms => Promise.race([rd(), sleep(ms).then(() => null)]);
+  const send = b => dev.transferOut(epOut, Uint8Array.of(b));
+
+  // Phase 1: spam 0xA0 until 0x5F (preloader window / BROM)
+  log('syncing: sending 0xA0 until 0x5F ... (reconnect device now if needed)');
+  const t0 = Date.now();
+  for (;;) {
+    await send(0xA0);
+    const r = await read1(50);
+    if (r && r[0] === 0x5F) { log('0xA0 -> 0x5F'); break; }
+    if (Date.now() - t0 > 30000) throw new Error('sync timeout');
+  }
+
+  // Phase 2: remaining pairs, each reply is the bitwise inverse
+  for (const [tx, rx] of [[0x0A, 0xF5], [0x50, 0xAF], [0x05, 0xFA]]) {
+    await send(tx);
+    const r = await read1(1000);
+    if (!r) throw new Error(`no reply to ${hex(tx)}`);
+    if (r[0] !== rx) throw new Error(`${hex(tx)} -> ${hex(r[0])}, expected ${hex(rx)}`);
+    log(`${hex(tx)} -> ${hex(rx)}`);
+  }
+  log('handshake OK');
+}
+
+document.getElementById('go').onclick = () => run().catch(e => log('ERROR: ' + e.message));
+</script>
