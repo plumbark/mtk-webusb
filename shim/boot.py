@@ -13,10 +13,6 @@ import sys
 import time
 import types
 
-import webserial_class
-from webserial_class import IN_BROWSER, get_bridge, run_sync
-
-
 def _stub(name, **attrs):
     mod = types.ModuleType(name)
     mod.__dict__.update(attrs)
@@ -29,17 +25,8 @@ class _Blank:
         return ""
 
 
-def install_stubs():
-    # Transport modules: Port.py does `from ...seriallib import SerialClass`,
-    # so handing it WebSerialClass needs no change to mtkclient itself.
-    class _NoUsb:
-        def __init__(self, *a, **k):
-            raise RuntimeError("Raw USB transport is not available in the browser; use Web Serial.")
-
-    _stub("usb")
-    _stub("mtkclient.Library.Connection.usblib", UsbClass=_NoUsb, usb=sys.modules["usb"])
-    _stub("mtkclient.Library.Connection.seriallib", SerialClass=webserial_class.WebSerialClass)
-
+def install_base_stubs():
+    """Must run before ANY mtkclient module is imported (gui_utils imports colorama at top level)."""
     try:
         import colorama  # noqa: F401
     except ImportError:
@@ -49,6 +36,18 @@ def install_stubs():
         import Cryptodome  # noqa: F401
     except ImportError:
         _alias_cryptodome()
+
+
+def install_stubs():
+    """Transport stand-ins. Port.py does `from ...seriallib import SerialClass`, so handing it
+    WebSerialClass needs no change to mtkclient itself."""
+    class _NoUsb:
+        def __init__(self, *a, **k):
+            raise RuntimeError("Raw USB transport is not available in the browser; use Web Serial.")
+
+    _stub("usb")
+    _stub("mtkclient.Library.Connection.usblib", UsbClass=_NoUsb, usb=sys.modules["usb"])
+    _stub("mtkclient.Library.Connection.seriallib", SerialClass=webserial_class.WebSerialClass)
 
 
 def _alias_cryptodome():
@@ -70,6 +69,12 @@ def _alias_cryptodome():
             pass
 
     sys.meta_path.insert(0, _Alias())
+
+
+install_base_stubs()
+
+import webserial_class  # noqa: E402  (imports mtkclient; needs the stubs above)
+from webserial_class import IN_BROWSER, get_bridge, run_sync  # noqa: E402
 
 
 def install_async_sleep():
