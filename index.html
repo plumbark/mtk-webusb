@@ -19,14 +19,32 @@ const PYODIDE = 'https://cdn.jsdelivr.net/pyodide/v0.28.0/full/';
 const bridge = window.mtkBridge = {
   port: null, reader: null, writer: null, chunks: [], queued: 0, wake: null, pumpErr: null, cancelled: false,
 
+  async findPort() {   // granted ports re-appear as new objects after the phone re-enumerates
+    const mtk = (await navigator.serial.getPorts()).filter(p => p.getInfo().usbVendorId === 0x0E8D);
+    return mtk.find(p => p.connected) || mtk[0] || null;
+  },
   async pick() {
-    this.port = (await navigator.serial.getPorts()).find(p => p.getInfo().usbVendorId === 0x0E8D)
-             || await navigator.serial.requestPort({ filters: [{ usbVendorId: 0x0E8D }] });
+    this.traceN = 0;
+    this.port = await this.findPort() || await navigator.serial.requestPort({ filters: [{ usbVendorId: 0x0E8D }] });
+  },
+  warnOnce(m) { if (m !== this._lastWarn) { this._lastWarn = m; log('[serial] ' + m); } },
+  traceN: 0,
+  t(dir, u8) {
+    if (this.traceN++ < 80)
+      log(`[io] ${dir} ${u8.length ? Array.from(u8, b => b.toString(16).padStart(2, '0')).join(' ') : '-'}`);
   },
   async open() {
-    if (!this.port) return false;
     if (this.reader) return true;
-    await this.port.open({ baudRate: 115200 });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (!this.port || attempt) this.port = await this.findPort() || this.port;
+        if (!this.port) return false;
+        await this.port.open({ baudRate: 115200 });
+        break;
+      } catch (e) {
+        if (attempt) { this.warnOnce('open failed: ' + (e.message || e)); return false; }
+      }
+    }
     try { await this.port.setSignals({ dataTerminalReady: true, requestToSend: true }); } catch {}
     this.writer = this.port.writable.getWriter();
     this.reader = this.port.readable.getReader();
@@ -52,6 +70,7 @@ const bridge = window.mtkBridge = {
   },
   async write(d) {
     const u8 = d instanceof Uint8Array ? d : new Uint8Array(d.toJs ? d.toJs() : d);
+    this.t('TX', u8);
     await this.writer.write(u8);
   },
   inWaiting() { return this.queued; },
@@ -74,6 +93,7 @@ const bridge = window.mtkBridge = {
       if (t === c.length) this.chunks.shift(); else this.chunks[0] = c.subarray(t);
     }
     this.queued -= k;
+    this.t('RX', out);
     return out;
   },
 };
@@ -99,13 +119,19 @@ async function loadPython() {
 }
 
 const goBtn = document.getElementById('go'), stopBtn = document.getElementById('stop');
+if (!navigator.serial) log('Web Serial unavailable (Chrome/Edge over https or localhost).');
+goBtn.disabled = true; goBtn.textContent = 'Loading Python...';
+loadPython().then(() => {
+  goBtn.disabled = !navigator.serial; goBtn.textContent = 'Connect + read device info';
+  log('ready. Plug the phone in (BROM mode) FIRST so it shows in the chooser; the handshake starts as soon as you pick it.');
+}).catch(e => log(`ERROR loading: ${e.message || e}`));
+
 goBtn.onclick = async () => {
-  if (!navigator.serial) return log('Web Serial unavailable (Chrome/Edge over https or localhost).');
   goBtn.disabled = true; stopBtn.disabled = false; bridge.cancelled = false;
   try {
     await bridge.pick();                       // needs the click's user gesture
     const p = await loadPython();
-    log('power the phone off, hold the BROM key combo, plug in USB...');
+    log('handshaking...');
     const res = await p.runPythonAsync('import boot; boot.probe()');
     log('\nRESULT ' + res);
   } catch (e) {
